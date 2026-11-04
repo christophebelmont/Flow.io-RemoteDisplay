@@ -1,0 +1,29 @@
+{
+  "_meta": {
+    "generated": true,
+    "locale": "fr",
+    "version": 1
+  },
+  "docs": {
+    "network": {
+      "label_t": "cfgmods.network.label"
+    },
+    "network/wifi": {
+      "label_t": "cfgmods.network.wifi.label"
+    }
+  },
+  "meta": {
+    "cfg_tree_aliases": [
+      {
+        "display": "network/wifi",
+        "store": "wifi"
+      }
+    ],
+    "cfg_tree_virtual_branches": [
+      {
+        "display": "network",
+        "children": ["wifi"]
+      }
+    ]
+  }
+}
