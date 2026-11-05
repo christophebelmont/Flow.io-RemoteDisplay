@@ -9,6 +9,7 @@
 #include "Core/Hmi/HmiUdpProtocol.h"
 #include "Core/Module.h"
 #include "Core/NvsKeys.h"
+#include "Core/ServiceBinding.h"
 #include "Core/Services/Services.h"
 #include "Modules/HMIModule/Drivers/NextionDriver.h"
 
@@ -42,21 +43,19 @@ private:
     static constexpr uint32_t LinkTimeoutMs = 6000U;
     static constexpr uint32_t SleepLinkTimeoutMs = 120000U;
     static constexpr uint32_t AckRetryMs = 150U;
-    static constexpr uint8_t AckMaxAttempts = 7U;
+    // Keep the same reliable packet pending until ACK or link loss. A finite
+    // retry budget silently discarded user actions during transient outages.
+    static constexpr uint32_t AckRetryMaxMs = 2000U;
     static constexpr uint32_t HomeRefreshThrottleMs = 10000U;
     static constexpr uint32_t PageProbePeriodMs = 5000U;
     static constexpr uint32_t VersionProbeRetryMs = 2000U;
     static constexpr uint32_t VersionRecheckPeriodMs = 60000U;
     static constexpr uint32_t ConfigRenderDelayMs = 120U;
-    static constexpr uint32_t ConfigRenderRetryMs = 320U;
-    static constexpr uint8_t ConfigRenderPasses = 3U;
     static constexpr uint32_t ConfigValuesDelayMs = 80U;
-    static constexpr uint8_t ConfigValuesPasses = 2U;
     static constexpr uint8_t NEXTION_EVENT_QUEUE_SIZE = 6U;
     static constexpr uint32_t InputLockMaxMs = 5000U;
     static constexpr uint16_t NextionSleepNoTouchSeconds = 30U;
     static constexpr const char* FlowConnectionStateObject = "tFConnectState";
-    static constexpr const char* FlowCommunicationValueObject = "globals.vaFlowComm";
 
     struct ConfigData {
         char token[33]{};
@@ -69,6 +68,8 @@ private:
 
     WiFiUDP udp_{};
     NextionDriver nextion_{};
+    SemaphoreHandle_t nextionMutex_ = nullptr;
+    HmiService hmiService_{};
     ConfigStore* cfgStore_ = nullptr;
     const WifiService* wifiSvc_ = nullptr;
 
@@ -87,8 +88,6 @@ private:
     bool inputLocked_ = false;
     bool flowConnectInitialized_ = false;
     bool flowConnectVisible_ = false;
-    bool flowCommunicationValueKnown_ = false;
-    bool flowCommunicationValue_ = false;
     bool configPageActive_ = false;
     bool wifiFactoryResetPending_ = false;
     uint8_t lastFlowConnectPage_ = 0xFFU;
@@ -124,12 +123,12 @@ private:
     uint32_t pendingLastSendMs_ = 0;
 
     ConfigMenuView configView_{};
+    bool configViewCacheValid_ = false;
+    uint8_t configViewCachePageId_ = 0xFFU;
     bool configBatchActive_ = false;
     bool configRenderPending_ = false;
-    uint8_t configRenderRemaining_ = 0;
     uint32_t configRenderDueMs_ = 0;
     bool configValuesPending_ = false;
-    uint8_t configValuesRemaining_ = 0;
     uint32_t configValuesDueMs_ = 0;
 
     HmiEvent eventQueue_[NEXTION_EVENT_QUEUE_SIZE]{};
@@ -162,16 +161,17 @@ private:
     void scheduleConfigValuesRefresh_(uint32_t nowMs, const char* reason);
     void serviceConfigRendering_(uint32_t nowMs);
     void resetConfigView_();
+    void renderCachedConfigView_(const HmiEvent& event, uint32_t nowMs);
     void setInputLocked_(bool locked, const char* reason, uint32_t nowMs);
     void logDisplayState_(const char* reason, bool force = false);
     void logEvent_(const char* prefix, const HmiEvent& event) const;
     static bool isMenuEvent_(HmiEventType type);
     void servicePendingAck_(uint32_t nowMs);
     void setFlowConnectionVisible_(bool visible, const char* reason, bool force = false);
-    void setFlowCommunicationValue_(bool active, const char* reason, bool force = false);
     void markSeen_(uint32_t nowMs);
     void handleLinkLost_();
     bool wifiConnected_() const;
+    bool uploadNextionFirmware_(size_t imageSize, HmiFirmwareReadCallback read, void* readCtx);
     static void copyText_(char* out, size_t outLen, const char* in);
     static void nextionDebugCallback_(void* ctx, const char* kind, const uint8_t* data, uint8_t len);
     static const char* msgTypeName_(HmiUdpMsgType type);

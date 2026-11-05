@@ -55,6 +55,11 @@ struct HmiStatusLedState {
     uint16_t blinkOffMs = 250;
 };
 
+using HmiFirmwareReadCallback = bool (*)(void* ctx,
+                                         uint8_t* out,
+                                         size_t len,
+                                         uint32_t timeoutMs);
+
 struct HmiService {
     bool (*requestRefresh)(void* ctx);
     bool (*openConfigHome)(void* ctx);
@@ -76,4 +81,8 @@ struct HmiService {
     bool (*writeRtc)(void* ctx, const HmiRtcDateTime* value);
     bool (*isDisplaySleeping)(void* ctx);
     void* ctx;
+    bool (*uploadNextionFirmware)(void* ctx,
+                                  size_t imageSize,
+                                  HmiFirmwareReadCallback read,
+                                  void* readCtx);
 };

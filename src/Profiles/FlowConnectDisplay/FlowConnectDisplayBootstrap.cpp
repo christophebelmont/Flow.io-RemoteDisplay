@@ -4,6 +4,8 @@
 
 #include "App/AppContext.h"
 #include "Board/BoardSerialMap.h"
+#include "Core/Log.h"
+#include "Core/LogModuleIds.h"
 #include "Core/NvsKeys.h"
 
 namespace Profiles {
@@ -26,12 +28,18 @@ void setupProfile(AppContext& ctx)
     ctx.moduleManager.add(&modules.configStoreModule);
     ctx.moduleManager.add(&modules.dataStoreModule);
     ctx.moduleManager.add(&modules.wifiModule);
-    ctx.moduleManager.add(&modules.wifiProvisioningModule);
     ctx.moduleManager.add(&modules.flowConnectDisplayUdpClientModule);
+    ctx.moduleManager.add(&modules.wifiProvisioningModule);
 
     if (!ctx.moduleManager.initAll(ctx.registry, ctx.services)) {
         while (true) delay(1000);
     }
+
+    const uint32_t flashSizeBytes = ESP.getFlashChipSize();
+    Log::info((LogModuleId)LogModuleIdValue::Core,
+              "SPI flash detected: %lu bytes (%lu MiB)",
+              (unsigned long)flashSizeBytes,
+              (unsigned long)(flashSizeBytes / (1024UL * 1024UL)));
 }
 
 void loopProfile(AppContext&)

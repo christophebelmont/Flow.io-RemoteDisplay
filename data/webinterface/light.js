@@ -2,7 +2,22 @@ const $ = (id) => document.getElementById(id);
 
 const ui = {
   product: "flow.io",
-  rebootAfterWifi: false
+  rebootAfterWifi: false,
+  isDisplay: false
+};
+
+const webSerial = {
+  cursor: 0,
+  session: "",
+  paused: false,
+  history: "",
+  timer: 0,
+  started: false
+};
+
+const moduleLogLevels = {
+  modules: [],
+  loading: false
 };
 
 function status(text) {
@@ -35,6 +50,145 @@ function applyBrand(meta) {
 function applyCapabilities(meta) {
   ui.product = String((meta && meta.product_name) || ui.product);
   ui.rebootAfterWifi = !!(meta && meta.reboot_after_wifi_save);
+  const profile = String((meta && (meta.profile || meta.profile_name)) || "").toLowerCase();
+  ui.isDisplay = ui.product === "Flow Connect Display" ||
+    profile.indexOf("flowconnectdisplay") >= 0 ||
+    profile.indexOf("flow_connect_display") >= 0;
+  $("firmwareBox").classList.toggle("hidden", !ui.isDisplay);
+  $("nextionFirmwareBox").classList.toggle("hidden", !ui.isDisplay);
+  $("webSerialBox").classList.toggle("hidden", !ui.isDisplay);
+  if (ui.isDisplay && !webSerial.started) {
+    webSerial.started = true;
+    pollWebSerial();
+  }
+}
+
+function setWebSerialStatus(message) {
+  $("webSerialStatus").textContent = message;
+}
+
+function appendWebSerialText(text) {
+  if (!text) return;
+  webSerial.history = (webSerial.history + text).slice(-65536);
+  const output = $("webSerialOutput");
+  output.textContent = webSerial.history;
+  if ($("webSerialFollow").checked) output.scrollTop = output.scrollHeight;
+}
+
+async function pollWebSerial() {
+  if (!webSerial.paused && !document.hidden) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 4000);
+    try {
+      const query = new URLSearchParams({
+        cursor: String(webSerial.cursor),
+        session: webSerial.session
+      });
+      const response = await fetch("/api/logs?" + query.toString(), {
+        cache: "no-store",
+        signal: controller.signal
+      });
+      if (!response.ok) throw new Error("HTTP " + response.status);
+      const text = await response.text();
+      const nextSession = response.headers.get("X-Log-Session") || "";
+      if (webSerial.session && webSerial.session !== nextSession) {
+        appendWebSerialText("\n— ESP redémarré —\n");
+      }
+      webSerial.session = nextSession;
+      webSerial.cursor = Number(response.headers.get("X-Log-Cursor")) || 0;
+      const lost = Number(response.headers.get("X-Log-Lost")) || 0;
+      if (lost) appendWebSerialText("— " + lost + " anciennes lignes non conservées —\n");
+      appendWebSerialText(text);
+      setWebSerialStatus("Connecté · actualisation chaque seconde");
+    } catch (err) {
+      setWebSerialStatus("Connexion interrompue · nouvelle tentative automatique");
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+  webSerial.timer = setTimeout(pollWebSerial, 1000);
+}
+
+function initializeWebSerial() {
+  refreshModuleLogLevels();
+  $("webSerialPause").addEventListener("click", () => {
+    webSerial.paused = !webSerial.paused;
+    $("webSerialPause").textContent = webSerial.paused ? "Reprendre" : "Pause";
+    setWebSerialStatus(webSerial.paused ? "En pause" : "Reprise…");
+  });
+  $("webSerialClear").addEventListener("click", () => {
+    webSerial.history = "";
+    $("webSerialOutput").textContent = "";
+  });
+  $("webSerialSave").addEventListener("click", () => {
+    const url = URL.createObjectURL(new Blob([webSerial.history], { type: "text/plain;charset=utf-8" }));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "flowio-logs.txt";
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  });
+}
+
+function renderModuleLogLevels() {
+  const container = $("moduleLogLevels");
+  container.textContent = "";
+  for (const module of moduleLogLevels.modules) {
+    const row = document.createElement("div");
+    row.className = "module-log-row";
+
+    const description = document.createElement("div");
+    const name = document.createElement("div");
+    name.className = "module-log-name";
+    name.textContent = module.name;
+    const current = document.createElement("div");
+    current.className = "module-log-state";
+    const levelNames = { debug: "Debug", info: "Info", warn: "Warning", error: "Error" };
+    current.textContent = "Actif : " + (levelNames[module.level] || "Info");
+    description.append(name, current);
+
+    const actions = document.createElement("div");
+    actions.className = "module-log-actions";
+    for (const level of ["debug", "info"]) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "secondary" + (module.level === level ? " selected" : "");
+      button.textContent = level === "debug" ? "Debug" : "Info";
+      button.disabled = moduleLogLevels.loading;
+      button.addEventListener("click", () => setModuleLogLevel(module.id, level));
+      actions.appendChild(button);
+    }
+    row.append(description, actions);
+    container.appendChild(row);
+  }
+}
+
+async function refreshModuleLogLevels() {
+  try {
+    const data = await json("/api/log-levels", { cache: "no-store" });
+    moduleLogLevels.modules = Array.isArray(data.modules) ? data.modules : [];
+    renderModuleLogLevels();
+  } catch (err) {
+    $("moduleLogLevels").textContent = "Réglage des niveaux de logs indisponible.";
+  }
+}
+
+async function setModuleLogLevel(moduleId, level) {
+  moduleLogLevels.loading = true;
+  renderModuleLogLevels();
+  try {
+    await json("/api/log-levels", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: form({ module: String(moduleId), level })
+    });
+    await refreshModuleLogLevels();
+  } catch (err) {
+    setWebSerialStatus("Impossible de modifier le niveau de log.");
+  } finally {
+    moduleLogLevels.loading = false;
+    renderModuleLogLevels();
+  }
 }
 
 let scanTimer = 0;
@@ -166,11 +320,90 @@ async function saveWifi() {
   }
 }
 
+function uploadFirmwareFile(options) {
+  const file = $(options.fileId).files[0];
+  const statusNode = $(options.statusId);
+  if (!file) {
+    statusNode.textContent = "Sélectionnez un fichier " + options.extension + ".";
+    return;
+  }
+  if (!file.name.toLowerCase().endsWith(options.extension)) {
+    statusNode.textContent = "Le fichier doit avoir l’extension " + options.extension + ".";
+    return;
+  }
+  if (!window.confirm(options.confirmText)) return;
+
+  const button = $(options.buttonId);
+  const progress = $(options.progressId);
+  const request = new XMLHttpRequest();
+  button.disabled = true;
+  progress.value = 0;
+  statusNode.textContent = "Envoi du firmware...";
+  request.open("POST", options.endpoint);
+  request.setRequestHeader("Content-Type", "application/octet-stream");
+  request.timeout = 180000;
+  request.upload.onprogress = (event) => {
+    if (!event.lengthComputable) return;
+    progress.value = Math.round((event.loaded / event.total) * 100);
+    statusNode.textContent = "Envoi du firmware : " + progress.value + "%";
+  };
+  request.onload = () => {
+    let result = null;
+    try { result = JSON.parse(request.responseText); } catch (err) { /* handled below */ }
+    if (request.status === 202 && result && result.ok) {
+      progress.value = 100;
+      statusNode.textContent = options.successText;
+      return;
+    }
+    statusNode.textContent = options.failureText ||
+      "Mise à jour refusée ou invalide (HTTP " + request.status + ").";
+    button.disabled = false;
+  };
+  request.onerror = () => {
+    statusNode.textContent = "Connexion interrompue. Vérifiez l’état de l’équipement avant de réessayer.";
+    button.disabled = false;
+  };
+  request.ontimeout = () => {
+    statusNode.textContent = "Délai d’envoi dépassé. Vérifiez l’état de l’équipement avant de réessayer.";
+    button.disabled = false;
+  };
+  request.send(file);
+}
+
+function uploadEspFirmware() {
+  uploadFirmwareFile({
+    fileId: "firmwareFile",
+    buttonId: "firmwareUpload",
+    progressId: "firmwareProgress",
+    statusId: "firmwareStatus",
+    extension: ".bin",
+    endpoint: "/api/system/firmware",
+    confirmText: "L’ESP va redémarrer après la mise à jour. Continuer ?",
+    successText: "Firmware reçu et vérifié. Redémarrage de l’ESP..."
+  });
+}
+
+function uploadNextionFirmware() {
+  uploadFirmwareFile({
+    fileId: "nextionFirmwareFile",
+    buttonId: "nextionFirmwareUpload",
+    progressId: "nextionFirmwareProgress",
+    statusId: "nextionFirmwareStatus",
+    extension: ".tft",
+    endpoint: "/api/system/nextion-firmware",
+    confirmText: "L’écran Nextion va redémarrer après la mise à jour. Continuer ?",
+    successText: "Firmware reçu et acquitté. Redémarrage du Nextion...",
+    failureText: "Le transfert a échoué. Le Nextion peut nécessiter un redémarrage ou un nouveau chargement."
+  });
+}
+
 $("wifiScanBtn").addEventListener("click", () => refreshWifiScan(true));
 $("wifiSsidList").addEventListener("change", () => {
   const value = $("wifiSsidList").value;
   if (value) $("wifiSsid").value = value;
 });
 $("wifiSave").addEventListener("click", () => saveWifi());
-
+$("firmwareUpload").addEventListener("click", () => uploadEspFirmware());
+$("nextionFirmwareUpload").addEventListener("click", () => uploadNextionFirmware());
+initializeWebSerial();
 loadAll();

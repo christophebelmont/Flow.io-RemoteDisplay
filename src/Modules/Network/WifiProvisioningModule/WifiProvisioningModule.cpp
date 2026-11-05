@@ -7,18 +7,21 @@
 
 #include "App/BuildFlags.h"
 #include "Core/FirmwareVersion.h"
+#if defined(FLOW_PROFILE_FLOW_CONNECT_DISPLAY)
+#include "Core/Generated/ProvisioningPortalAssets_Generated.h"
+#endif
 
 #define LOG_MODULE_ID ((LogModuleId)LogModuleIdValue::WifiProvisioningModule)
 #include "Core/ModuleLog.h"
 
 #include <ArduinoJson.h>
-#include <FS.h>
-#include <SPIFFS.h>
+#include <Update.h>
 #include <WiFi.h>
 #include <esp_heap_caps.h>
 #include <esp_system.h>
 #include <esp_wifi.h>
 
+#include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 
@@ -29,6 +32,35 @@ constexpr wifi_auth_mode_t kProvisioningApAuthMode = WIFI_AUTH_WPA2_PSK;
 constexpr wifi_cipher_type_t kProvisioningApCipher = WIFI_CIPHER_TYPE_CCMP;
 constexpr uint8_t kProvisioningApChannel = 1U;
 constexpr uint8_t kProvisioningApMaxConnections = 2U;
+
+#if defined(FLOW_PROFILE_FLOW_CONNECT_DISPLAY)
+struct WebLogModuleOption {
+    LogModuleId id;
+    const char* name;
+};
+
+constexpr WebLogModuleOption kWebLogModules[] = {
+    {(LogModuleId)LogModuleIdValue::FlowConnectDisplayUdpClientModule, "Flow Connect Display / Nextion"},
+    {(LogModuleId)LogModuleIdValue::WifiModule, "WiFi"},
+    {(LogModuleId)LogModuleIdValue::WifiProvisioningModule, "Portail Web"},
+    {(LogModuleId)LogModuleIdValue::LogHub, "LogHub"},
+    {(LogModuleId)LogModuleIdValue::LogDispatcher, "Distribution des logs"},
+    {(LogModuleId)LogModuleIdValue::EventBusModule, "Bus d’événements"},
+    {(LogModuleId)LogModuleIdValue::ConfigStoreModule, "Configuration"},
+    {(LogModuleId)LogModuleIdValue::DataStoreModule, "Données"}
+};
+
+const char* logLevelName_(LogLevel level)
+{
+    switch (level) {
+        case LogLevel::Debug: return "debug";
+        case LogLevel::Info: return "info";
+        case LogLevel::Warn: return "warn";
+        case LogLevel::Error: return "error";
+    }
+    return "info";
+}
+#endif
 
 const char* wifiModeName_(wifi_mode_t mode)
 {
@@ -90,6 +122,13 @@ void WifiProvisioningModule::init(ConfigStore& cfg, ServiceRegistry& services)
     services_ = &services;
     wifiSvc_ = services.get<WifiService>(ServiceId::Wifi);
     hmiSvc_ = services.get<HmiService>(ServiceId::Hmi);
+#if defined(FLOW_PROFILE_FLOW_CONNECT_DISPLAY)
+    logHubSvc_ = services.get<LogHubService>(ServiceId::LogHub);
+    webLogSession_ = esp_random();
+    const LogSinkRegistryService* sinks = services.get<LogSinkRegistryService>(ServiceId::LogSinks);
+    webLogSinkRegistered_ = sinks && sinks->add &&
+        sinks->add(sinks->ctx, {&WifiProvisioningModule::captureWebLog_, this});
+#endif
     const EventBusService* eventBusSvc = services.get<EventBusService>(ServiceId::EventBus);
     eventBus_ = eventBusSvc ? eventBusSvc->bus : nullptr;
     if (eventBus_) {
@@ -234,6 +273,13 @@ void WifiProvisioningModule::loop()
                                    ? "Ethernet is available"
                                    : "STA connected");
         }
+#if defined(FLOW_PROFILE_FLOW_CONNECT_DISPLAY)
+        // The embedded setup interface is also the minimal system configuration
+        // page in normal station mode. Keep its HTTP service available after
+        // provisioning, without running captive DNS outside the provisioning AP.
+        startLightPortal_();
+        handleLightPortalClient_();
+#endif
         networkManager_.setNormalServicesStarted(true);
         portalLatched_ = false;
         vTaskDelay(pdMS_TO_TICKS(250));
@@ -791,16 +837,174 @@ bool WifiProvisioningModule::getApIp_(char* out, size_t len) const
 }
 
 #if defined(FLOW_PROFILE_FLOW_CONNECT_DISPLAY)
+void WifiProvisioningModule::captureWebLog_(void* ctx, const LogEntry& entry)
+{
+    WifiProvisioningModule* self = static_cast<WifiProvisioningModule*>(ctx);
+    if (!self) return;
+
+    const char* module = self->logHubSvc_ && self->logHubSvc_->resolveModuleName
+                             ? self->logHubSvc_->resolveModuleName(self->logHubSvc_->ctx, entry.moduleId)
+                             : logModuleNameFromId(entry.moduleId);
+    const char* level = "?";
+    switch (entry.lvl) {
+        case LogLevel::Debug: level = "D"; break;
+        case LogLevel::Info: level = "I"; break;
+        case LogLevel::Warn: level = "W"; break;
+        case LogLevel::Error: level = "E"; break;
+    }
+
+    char line[WebLogBuffer::LineSize] = {0};
+    snprintf(line, sizeof(line), "[%lu ms][%s][%.24s] %.159s",
+             (unsigned long)entry.ts_ms,
+             level,
+             module ? module : "unknown",
+             entry.msg);
+    portENTER_CRITICAL(&self->webLogsMux_);
+    self->webLogs_.append(line);
+    portEXIT_CRITICAL(&self->webLogsMux_);
+}
+
+void WifiProvisioningModule::sendWebLogs_(WiFiClient& client, const char* query)
+{
+    uint32_t cursor = 0U;
+    uint32_t requestedSession = 0U;
+    bool haveSession = false;
+    if (query && query[0] != '\0') {
+        const char* cursorArg = strstr(query, "cursor=");
+        if (cursorArg) {
+            cursorArg += 7;
+            char* end = nullptr;
+            const unsigned long parsed = strtoul(cursorArg, &end, 10);
+            if (end == cursorArg || (*end != '\0' && *end != '&') || parsed > UINT32_MAX) {
+                sendPlain_(client, "400 Bad Request", "Invalid log cursor");
+                return;
+            }
+            cursor = (uint32_t)parsed;
+        }
+        const char* sessionArg = strstr(query, "session=");
+        if (sessionArg) {
+            sessionArg += 8;
+            char* end = nullptr;
+            const unsigned long parsed = strtoul(sessionArg, &end, 10);
+            if (end != sessionArg && (*end == '\0' || *end == '&') && parsed <= UINT32_MAX) {
+                requestedSession = (uint32_t)parsed;
+                haveSession = true;
+            }
+        }
+    }
+
+    if (!webLogSinkRegistered_) {
+        sendPlain_(client, "503 Service Unavailable", "Log capture unavailable");
+        return;
+    }
+    if (!haveSession || requestedSession != webLogSession_) cursor = 0U;
+
+    char output[WebLogBuffer::LineSize * 4U] = {0};
+    WebLogBuffer::ReadResult result{};
+    portENTER_CRITICAL(&webLogsMux_);
+    result = webLogs_.read(cursor, output, sizeof(output));
+    portEXIT_CRITICAL(&webLogsMux_);
+
+    char headers[192] = {0};
+    const int headerLength = snprintf(headers, sizeof(headers),
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\n"
+        "Cache-Control: no-store\r\nConnection: close\r\n"
+        "X-Log-Session: %lu\r\nX-Log-Cursor: %lu\r\nX-Log-Lost: %lu\r\n\r\n",
+        (unsigned long)webLogSession_,
+        (unsigned long)result.cursor,
+        (unsigned long)result.lost);
+    if (headerLength > 0 && (size_t)headerLength < sizeof(headers)) {
+        client.write((const uint8_t*)headers, (size_t)headerLength);
+        client.write((const uint8_t*)output, strlen(output));
+    }
+}
+
+void WifiProvisioningModule::sendLogLevels_(WiFiClient& client)
+{
+    if (!logHubSvc_ || !logHubSvc_->getModuleMinLevel) {
+        sendJson_(client, "503 Service Unavailable", "{\"ok\":false,\"error\":\"log_levels_unavailable\"}");
+        return;
+    }
+
+    char response[768] = {0};
+    size_t used = (size_t)snprintf(response, sizeof(response), "{\"ok\":true,\"modules\":[");
+    for (size_t i = 0; i < sizeof(kWebLogModules) / sizeof(kWebLogModules[0]); ++i) {
+        const WebLogModuleOption& option = kWebLogModules[i];
+        const LogLevel level = logHubSvc_->getModuleMinLevel(logHubSvc_->ctx, option.id);
+        const int wrote = snprintf(response + used,
+                                   sizeof(response) - used,
+                                   "%s{\"id\":%u,\"name\":\"%s\",\"level\":\"%s\"}",
+                                   i == 0U ? "" : ",",
+                                   (unsigned)option.id,
+                                   option.name,
+                                   logLevelName_(level));
+        if (wrote < 0 || (size_t)wrote >= sizeof(response) - used) {
+            sendJson_(client, "500 Internal Server Error", "{\"ok\":false,\"error\":\"log_levels_overflow\"}");
+            return;
+        }
+        used += (size_t)wrote;
+    }
+    if (used + 3U >= sizeof(response)) {
+        sendJson_(client, "500 Internal Server Error", "{\"ok\":false,\"error\":\"log_levels_overflow\"}");
+        return;
+    }
+    memcpy(response + used, "]}", 3U);
+    sendJson_(client, "200 OK", response);
+}
+
+void WifiProvisioningModule::setLogLevel_(WiFiClient& client, const char* body)
+{
+    if (!body || !logHubSvc_ || !logHubSvc_->setModuleMinLevel) {
+        sendJson_(client, "503 Service Unavailable", "{\"ok\":false,\"error\":\"log_levels_unavailable\"}");
+        return;
+    }
+
+    char moduleValue[8] = {0};
+    char levelValue[8] = {0};
+    if (!getQueryParam_(body, "module", moduleValue, sizeof(moduleValue)) ||
+        !getQueryParam_(body, "level", levelValue, sizeof(levelValue))) {
+        sendJson_(client, "400 Bad Request", "{\"ok\":false,\"error\":\"invalid_log_level_request\"}");
+        return;
+    }
+
+    char* moduleEnd = nullptr;
+    const unsigned long parsedModule = strtoul(moduleValue, &moduleEnd, 10);
+    if (moduleEnd == moduleValue || *moduleEnd != '\0' || parsedModule > UINT16_MAX) {
+        sendJson_(client, "400 Bad Request", "{\"ok\":false,\"error\":\"invalid_log_module\"}");
+        return;
+    }
+
+    LogLevel level;
+    if (strcmp(levelValue, "debug") == 0) {
+        level = LogLevel::Debug;
+    } else if (strcmp(levelValue, "info") == 0) {
+        level = LogLevel::Info;
+    } else {
+        sendJson_(client, "400 Bad Request", "{\"ok\":false,\"error\":\"invalid_log_level\"}");
+        return;
+    }
+
+    bool allowed = false;
+    for (const WebLogModuleOption& option : kWebLogModules) {
+        if (option.id == (LogModuleId)parsedModule) {
+            allowed = true;
+            break;
+        }
+    }
+    const bool updated = allowed && logHubSvc_->setModuleMinLevel(logHubSvc_->ctx,
+                                                                  (LogModuleId)parsedModule,
+                                                                  level);
+    sendJson_(client,
+              updated ? "200 OK" : "400 Bad Request",
+              updated ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"log_module_unavailable\"}");
+}
+
 void WifiProvisioningModule::startLightPortal_()
 {
     if (portalHttpActive_) return;
-    portalSpiffsReady_ = SPIFFS.begin(false);
-    if (!portalSpiffsReady_) {
-        LOGW("Flow Connect Display provisioning SPIFFS mount failed; fallback page will be used");
-    }
     portalServer_.begin();
     portalHttpActive_ = true;
-    LOGI("Provisioning light HTTP started on port 80 spiffs=%d", (int)portalSpiffsReady_);
+    LOGI("Provisioning light HTTP started on port 80 assets=embedded");
 }
 
 void WifiProvisioningModule::stopLightPortal_()
@@ -868,6 +1072,21 @@ void WifiProvisioningModule::handleLightPortalClient_()
     }
 
     portalBody_[0] = '\0';
+    if (strcmp(portalMethod_, "POST") == 0) {
+        if (strcmp(portalPath_, "/api/system/firmware") == 0) {
+            handleFirmwareUpload_(client, contentLen);
+            client.clear();
+            client.stop();
+            return;
+        }
+        if (strcmp(portalPath_, "/api/system/nextion-firmware") == 0) {
+            handleNextionFirmwareUpload_(client, contentLen);
+            client.clear();
+            client.stop();
+            return;
+        }
+    }
+
     if (contentLen > 0U && !readRequestBody_(client, contentLen, portalBody_, sizeof(portalBody_))) {
         sendPlain_(client, "413 Payload Too Large", "Payload too large");
         client.stop();
@@ -899,20 +1118,20 @@ bool WifiProvisioningModule::handleLightPortalRequest_(WiFiClient& client,
                               strcmp(path, "/hotspot-detect.html") == 0 ||
                               strcmp(path, "/connecttest.txt") == 0 ||
                               strcmp(path, "/ncsi.txt") == 0)) {
-        if (!sendSpiffsAsset_(client, "/webinterface/light.html", "text/html; charset=utf-8")) {
+        if (!sendEmbeddedAsset_(client, "/webinterface/light.html")) {
             sendPortalFallbackPage_(client, nullptr, false);
         }
         return true;
     }
 
     if ((isGet || isHead) && strcmp(path, "/webinterface/light.css") == 0) {
-        if (!sendSpiffsAsset_(client, "/webinterface/light.css", "text/css; charset=utf-8")) {
+        if (!sendEmbeddedAsset_(client, "/webinterface/light.css")) {
             sendPlain_(client, "404 Not Found", "Not found");
         }
         return true;
     }
     if ((isGet || isHead) && strcmp(path, "/webinterface/light.js") == 0) {
-        if (!sendSpiffsAsset_(client, "/webinterface/light.js", "application/javascript; charset=utf-8")) {
+        if (!sendEmbeddedAsset_(client, "/webinterface/light.js")) {
             sendPlain_(client, "404 Not Found", "Not found");
         }
         return true;
@@ -922,6 +1141,20 @@ bool WifiProvisioningModule::handleLightPortalRequest_(WiFiClient& client,
         sendWebMetaJson_(client);
         return true;
     }
+#if defined(FLOW_PROFILE_FLOW_CONNECT_DISPLAY)
+    if ((isGet || isHead) && strcmp(path, "/api/logs") == 0) {
+        sendWebLogs_(client, query);
+        return true;
+    }
+    if ((isGet || isHead) && strcmp(path, "/api/log-levels") == 0) {
+        sendLogLevels_(client);
+        return true;
+    }
+    if (isPost && strcmp(path, "/api/log-levels") == 0) {
+        setLogLevel_(client, body);
+        return true;
+    }
+#endif
     if ((isGet || isHead) && strcmp(path, "/api/wifi/config") == 0) {
         sendWifiConfigJson_(client);
         return true;
@@ -989,39 +1222,165 @@ void WifiProvisioningModule::sendPlain_(WiFiClient& client, const char* status, 
     client.print(body ? body : "");
 }
 
-bool WifiProvisioningModule::sendSpiffsAsset_(WiFiClient& client, const char* path, const char* contentType)
+bool WifiProvisioningModule::sendEmbeddedAsset_(WiFiClient& client, const char* path)
 {
-    if (!portalSpiffsReady_ || !path || !contentType) return false;
-
-    char gzipPath[96] = {0};
-    const char* servedPath = path;
-    bool gzip = false;
-    const int n = snprintf(gzipPath, sizeof(gzipPath), "%s.gz", path);
-    if (n > 0 && (size_t)n < sizeof(gzipPath) && SPIFFS.exists(gzipPath)) {
-        servedPath = gzipPath;
-        gzip = true;
-    } else if (!SPIFFS.exists(path)) {
-        return false;
-    }
-
-    File file = SPIFFS.open(servedPath, FILE_READ);
-    if (!file) return false;
+    const ProvisioningPortalAssets::Asset* asset = ProvisioningPortalAssets::find(path);
+    if (!asset) return false;
 
     client.print(F("HTTP/1.1 200 OK\r\nContent-Type: "));
-    client.print(contentType);
+    client.print(asset->contentType);
     client.print(F("\r\nCache-Control: no-store\r\nConnection: close\r\n"));
-    if (gzip) {
-        client.print(F("Content-Encoding: gzip\r\nVary: Accept-Encoding\r\n"));
-    }
-    client.print(F("\r\n"));
+    client.print(F("Content-Encoding: gzip\r\nVary: Accept-Encoding\r\nContent-Length: "));
+    client.print((unsigned long)asset->size);
+    client.print(F("\r\n\r\n"));
 
-    while (file.available()) {
-        const size_t rd = file.read(portalFileBuf_, sizeof(portalFileBuf_));
-        if (rd == 0U) break;
-        client.write(portalFileBuf_, rd);
+    size_t offset = 0U;
+    while (offset < asset->size) {
+        const size_t chunkSize = (asset->size - offset < sizeof(portalFileBuf_))
+                                     ? asset->size - offset
+                                     : sizeof(portalFileBuf_);
+        memcpy(portalFileBuf_, asset->data + offset, chunkSize);
+        const size_t written = client.write(portalFileBuf_, chunkSize);
+        if (written != chunkSize) break;
+        offset += written;
     }
-    file.close();
-    return true;
+    return offset == asset->size;
+}
+
+void WifiProvisioningModule::handleFirmwareUpload_(WiFiClient& client, size_t contentLength)
+{
+    if (contentLength == 0U) {
+        sendJson_(client, "400 Bad Request", "{\"ok\":false,\"error\":\"empty_firmware\"}");
+        return;
+    }
+
+    if (!Update.begin(contentLength, U_FLASH)) {
+        LOGW("Web firmware update rejected size=%lu reason=%s",
+             (unsigned long)contentLength,
+             Update.errorString());
+        sendJson_(client, "400 Bad Request", "{\"ok\":false,\"error\":\"firmware_not_accepted\"}");
+        return;
+    }
+
+    constexpr uint32_t UploadIdleTimeoutMs = 10000U;
+    constexpr uint32_t UploadTotalTimeoutMs = 180000U;
+    const uint32_t uploadStartedMs = millis();
+    uint32_t lastDataMs = uploadStartedMs;
+    size_t received = 0U;
+    size_t lastProgressLog = 0U;
+    LOGI("Web firmware update started size=%lu",
+         (unsigned long)contentLength);
+
+    while (received < contentLength) {
+        if ((uint32_t)(millis() - uploadStartedMs) >= UploadTotalTimeoutMs ||
+            (uint32_t)(millis() - lastDataMs) >= UploadIdleTimeoutMs ||
+            !client.connected()) {
+            Update.abort();
+            LOGW("Web firmware update interrupted received=%lu/%lu",
+                 (unsigned long)received,
+                 (unsigned long)contentLength);
+            sendJson_(client, "408 Request Timeout", "{\"ok\":false,\"error\":\"upload_interrupted\"}");
+            return;
+        }
+
+        const int available = client.available();
+        if (available <= 0) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+            continue;
+        }
+
+        const size_t remaining = contentLength - received;
+        const size_t chunkCapacity = sizeof(portalFileBuf_);
+        const size_t chunkSize = ((size_t)available < remaining)
+                                     ? (((size_t)available < chunkCapacity) ? (size_t)available : chunkCapacity)
+                                     : ((remaining < chunkCapacity) ? remaining : chunkCapacity);
+        const int bytesRead = client.read(portalFileBuf_, chunkSize);
+        if (bytesRead <= 0) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+            continue;
+        }
+
+        const size_t bytesWritten = Update.write(portalFileBuf_, (size_t)bytesRead);
+        if (bytesWritten != (size_t)bytesRead) {
+            LOGE("Web firmware update write failed at=%lu reason=%s",
+                 (unsigned long)received,
+                 Update.errorString());
+            Update.abort();
+            sendJson_(client, "500 Internal Server Error", "{\"ok\":false,\"error\":\"flash_write_failed\"}");
+            return;
+        }
+
+        received += bytesWritten;
+        lastDataMs = millis();
+        const size_t progressPercent = (received * 100U) / contentLength;
+        if (progressPercent >= lastProgressLog + 10U) {
+            lastProgressLog = progressPercent - (progressPercent % 10U);
+            LOGI("Web firmware update progress=%u%%", (unsigned)lastProgressLog);
+        }
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+
+    if (!Update.end(false)) {
+        LOGE("Web firmware update validation failed reason=%s", Update.errorString());
+        sendJson_(client, "400 Bad Request", "{\"ok\":false,\"error\":\"invalid_firmware_image\"}");
+        return;
+    }
+
+    LOGI("Web firmware update complete size=%lu; reboot scheduled",
+         (unsigned long)received);
+    sendJson_(client, "202 Accepted", "{\"ok\":true,\"reboot_scheduled\":true}");
+    schedulePortalReboot_(1500U);
+}
+
+void WifiProvisioningModule::handleNextionFirmwareUpload_(WiFiClient& client, size_t contentLength)
+{
+    static constexpr size_t MinNextionFirmwareSize = 256U;
+    static constexpr size_t MaxNextionFirmwareSize = 8U * 1024U * 1024U;
+    if (contentLength < MinNextionFirmwareSize || contentLength > MaxNextionFirmwareSize) {
+        sendJson_(client, "413 Payload Too Large", "{\"ok\":false,\"error\":\"tft_size_not_supported\"}");
+        return;
+    }
+    if (!hmiSvc_ || !hmiSvc_->uploadNextionFirmware) {
+        sendJson_(client, "503 Service Unavailable", "{\"ok\":false,\"error\":\"nextion_update_unavailable\"}");
+        return;
+    }
+
+    WiFiClient* sourceClient = &client;
+    const HmiFirmwareReadCallback readFirmware = [](void* ctx,
+                                                    uint8_t* out,
+                                                    size_t len,
+                                                    uint32_t timeoutMs) -> bool {
+        WiFiClient* stream = static_cast<WiFiClient*>(ctx);
+        if (!stream || !out || len == 0U) return false;
+        const uint32_t startedAtMs = millis();
+        size_t received = 0U;
+        while (received < len) {
+            const int available = stream->available();
+            if (available <= 0) {
+                if (!stream->connected() || (uint32_t)(millis() - startedAtMs) >= timeoutMs) return false;
+                vTaskDelay(pdMS_TO_TICKS(1));
+                continue;
+            }
+            const size_t remaining = len - received;
+            const size_t count = ((size_t)available < remaining) ? (size_t)available : remaining;
+            const int bytesRead = stream->read(out + received, count);
+            if (bytesRead > 0) received += (size_t)bytesRead;
+            else vTaskDelay(pdMS_TO_TICKS(1));
+        }
+        return true;
+    };
+
+    if (!hmiSvc_->uploadNextionFirmware(hmiSvc_->ctx,
+                                        contentLength,
+                                        readFirmware,
+                                        sourceClient)) {
+        LOGE("Web Nextion TFT upload failed size=%lu", (unsigned long)contentLength);
+        sendJson_(client, "500 Internal Server Error", "{\"ok\":false,\"error\":\"nextion_upload_failed\"}");
+        return;
+    }
+
+    LOGI("Web Nextion TFT upload complete size=%lu", (unsigned long)contentLength);
+    sendJson_(client, "202 Accepted", "{\"ok\":true,\"nextion_restarting\":true}");
 }
 
 void WifiProvisioningModule::sendPortalFallbackPage_(WiFiClient& client, const char* message, bool success)

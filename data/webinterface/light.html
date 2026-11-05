@@ -32,6 +32,35 @@
       <label>Mot de passe<input id="wifiPass" type="password" autocomplete="off" /></label>
       <button id="wifiSave" type="button">Valider</button>
     </section>
+    <section class="box hidden" id="firmwareBox">
+      <h2>Mise à jour du firmware</h2>
+      <p>Choisissez le fichier firmware .bin prévu pour Flow Connect Display. Gardez l’écran et l’ESP alimentés pendant le transfert.</p>
+      <label>Fichier firmware (.bin)<input id="firmwareFile" type="file" accept=".bin,application/octet-stream" /></label>
+      <button id="firmwareUpload" type="button">Mettre à jour</button>
+      <progress id="firmwareProgress" max="100" value="0"></progress>
+      <div id="firmwareStatus" role="status">Aucune mise à jour en cours.</div>
+    </section>
+    <section class="box hidden" id="nextionFirmwareBox">
+      <h2>Mise à jour de l’écran Nextion</h2>
+      <p>Choisissez le fichier TFT prévu pour ce modèle d’écran. Ne coupez pas l’alimentation pendant le transfert.</p>
+      <label>Fichier écran (.tft)<input id="nextionFirmwareFile" type="file" accept=".tft,application/octet-stream" /></label>
+      <button id="nextionFirmwareUpload" type="button">Mettre à jour l’écran</button>
+      <progress id="nextionFirmwareProgress" max="100" value="0"></progress>
+      <div id="nextionFirmwareStatus" role="status">Aucune mise à jour en cours.</div>
+    </section>
+    <section class="box hidden" id="webSerialBox">
+      <h2>WebSerial · logs ESP</h2>
+      <p>Logs locaux du firmware en direct · lecture seule</p>
+      <div id="moduleLogLevels" class="module-log-levels" aria-label="Niveaux de logs par module"></div>
+      <div class="actions">
+        <button class="secondary" id="webSerialPause" type="button">Pause</button>
+        <button class="secondary" id="webSerialClear" type="button">Effacer l’affichage</button>
+        <button class="secondary" id="webSerialSave" type="button">Télécharger</button>
+        <label class="serial-follow"><input id="webSerialFollow" type="checkbox" checked />Défilement automatique</label>
+      </div>
+      <div id="webSerialStatus" role="status">Connexion…</div>
+      <pre id="webSerialOutput" class="serial-output" aria-live="polite"></pre>
+    </section>
   </main>
   <script src="/webinterface/light.js"></script>
 </body>

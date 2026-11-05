@@ -6,6 +6,7 @@
 #include "Modules/HMIModule/Drivers/NextionDriver.h"
 
 #include <stdarg.h>
+#include <new>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -144,19 +145,28 @@ bool NextionDriver::begin()
     touchResponseLen_ = 0;
     currentPageKnown_ = false;
     currentPage_ = 0;
+    configVisibilityMask_ = 0U;
+    configVisibilityKnownMask_ = 0U;
 
     (void)refreshSleepState();
     (void)detectDisplayVersion();
     return true;
 }
 
-void NextionDriver::tick(uint32_t)
+void NextionDriver::tick(uint32_t nowMs)
 {
+    (void)nowMs;
 }
 
 bool NextionDriver::sendCmd_(const char* cmd)
 {
+    return sendRawCmd_(cmd);
+}
+
+bool NextionDriver::sendRawCmd_(const char* cmd)
+{
     if (!started_ || !cfg_.serial || !cmd) return false;
+    emitDebug_("tx-cmd", reinterpret_cast<const uint8_t*>(cmd), (uint8_t)strnlen(cmd, TxBufSize - 1U));
     cfg_.serial->print(cmd);
     cfg_.serial->write(NEXTION_FF);
     cfg_.serial->write(NEXTION_FF);
@@ -211,39 +221,91 @@ bool NextionDriver::setNumericValue(const char* objectName, uint32_t value)
     return sendNum_(objectName, value);
 }
 
-bool NextionDriver::showConfigLoading(const char* title)
+bool NextionDriver::uploadFirmware(size_t imageSize, HmiFirmwareReadCallback read, void* readCtx)
 {
-    if (sleeping_) return false;
-    if (!started_ || !pageReady_) return false;
+    static constexpr uint32_t UploadBaud = 460800U;
+    static constexpr size_t UploadPacketSize = 4096U;
 
+    if (!started_ || !cfg_.serial || sleeping_ || !read || imageSize == 0U || imageSize > UINT32_MAX) {
+        return false;
+    }
+
+    uint8_t* packet = new (std::nothrow) uint8_t[UploadPacketSize];
+    if (!packet) {
+        return false;
+    }
+
+    while (cfg_.serial->available() > 0) (void)cfg_.serial->read();
+    customFrameActive_ = false;
+    customExpectedLen_ = 0U;
+    customLen_ = 0U;
+    pageResponseActive_ = false;
+    pageResponseLen_ = 0U;
+    touchResponseActive_ = false;
+    touchResponseLen_ = 0U;
+
+    size_t firstChunkSize = imageSize < UploadPacketSize ? imageSize : UploadPacketSize;
+    if (!read(readCtx, packet, firstChunkSize, 10000U)) {
+        delete[] packet;
+        return false;
+    }
+
+    if (!sendCmdFmt_("whmi-wri %lu,%lu,0", (unsigned long)imageSize, (unsigned long)UploadBaud)) {
+        delete[] packet;
+        return false;
+    }
+    cfg_.serial->flush();
+    cfg_.serial->updateBaudRate(UploadBaud);
+    if (!waitUploadAck_(2000U)) {
+        cfg_.serial->updateBaudRate(cfg_.baud);
+        delete[] packet;
+        return false;
+    }
+
+    size_t offset = 0U;
     bool ok = true;
-    char path[96]{};
-    if (title && title[0] != '\0') {
-        snprintf(path, sizeof(path), "%s - Chargement...", title);
-    } else {
-        snprintf(path, sizeof(path), "Chargement...");
+    while (offset < imageSize) {
+        const size_t chunkSize = (imageSize - offset < UploadPacketSize)
+                                     ? imageSize - offset
+                                     : UploadPacketSize;
+        if (offset > 0U && !read(readCtx, packet, chunkSize, 10000U)) {
+            ok = false;
+            break;
+        }
+        if (cfg_.serial->write(packet, chunkSize) != chunkSize) {
+            ok = false;
+            break;
+        }
+        cfg_.serial->flush();
+        if (!waitUploadAck_(5000U)) {
+            ok = false;
+            break;
+        }
+        offset += chunkSize;
     }
-    ok = sendText_("tPath", path) && ok;
-    ok = sendCmd_("vis bHome,0") && ok;
-    ok = sendCmd_("vis bBack,0") && ok;
-    ok = sendCmd_("vis bValid,0") && ok;
-    ok = sendCmd_("vis bPrev,0") && ok;
-    ok = sendCmd_("vis bNext,0") && ok;
-    ok = sendCmd_("vaCtxRef.val=0") && ok;
-    for (uint8_t i = 0; i < ConfigMenuModel::RowsPerPage; ++i) {
-        char leftObj[8]{};
-        char rightObj[8]{};
-        char rowButtonObj[8]{};
-        char editTypeObj[16]{};
-        snprintf(leftObj, sizeof(leftObj), "tL%u", (unsigned)i);
-        snprintf(rightObj, sizeof(rightObj), "tV%u", (unsigned)i);
-        snprintf(rowButtonObj, sizeof(rowButtonObj), "bR%u", (unsigned)i);
-        snprintf(editTypeObj, sizeof(editTypeObj), "vaEditType%u", (unsigned)i);
-        ok = sendCmdFmt_("vis %s,0", leftObj) && ok;
-        ok = sendCmdFmt_("vis %s,0", rightObj) && ok;
-        ok = sendCmdFmt_("vis %s,0", rowButtonObj) && ok;
-    }
+
+    cfg_.serial->updateBaudRate(cfg_.baud);
+    delete[] packet;
+    versionDetected_ = false;
+    displayVersion_[0] = '\0';
+    communicationDetected_ = false;
+    pageReady_ = false;
+    currentPageKnown_ = false;
     return ok;
+}
+
+bool NextionDriver::waitUploadAck_(uint16_t timeoutMs)
+{
+    if (!cfg_.serial) return false;
+    const uint32_t startedAtMs = millis();
+    while ((uint32_t)(millis() - startedAtMs) < timeoutMs) {
+        while (cfg_.serial->available() > 0) {
+            const int value = cfg_.serial->read();
+            if (value == 0x05) return true;
+        }
+        delay(1);
+    }
+    return false;
 }
 
 bool NextionDriver::sendCmdFmt_(const char* fmt, ...)
@@ -634,6 +696,45 @@ bool NextionDriver::writeRtc(const HmiRtcDateTime& value)
     return ok;
 }
 
+bool NextionDriver::setConfigVisibility_(uint8_t bit, const char* objectName, bool visible)
+{
+    if (bit >= 23U || !objectName || objectName[0] == '\0') return false;
+    const uint32_t bitMask = 1UL << bit;
+    const bool wasKnown = (configVisibilityKnownMask_ & bitMask) != 0U;
+    const bool wasVisible = (configVisibilityMask_ & bitMask) != 0U;
+    if (wasKnown && wasVisible == visible) return true;
+
+    if (!sendCmdFmt_("vis %s,%u", objectName, visible ? 1U : 0U)) return false;
+    if (visible) configVisibilityMask_ |= bitMask;
+    else configVisibilityMask_ &= ~bitMask;
+    configVisibilityKnownMask_ |= bitMask;
+    return true;
+}
+
+void NextionDriver::noteConfigPageNavigation_()
+{
+    // Navigation scripts can change visibility locally. Reapply every field
+    // on the next render instead of trusting the previous screen's state.
+    configVisibilityMask_ = 0U;
+    configVisibilityKnownMask_ = 0U;
+}
+
+void NextionDriver::updateConfigPagination_(const ConfigMenuView& view)
+{
+    (void)sendCmdFmt_("nPage.val=%u", (unsigned)(view.pageIndex + 1U));
+    (void)sendCmdFmt_("nPages.val=%u", (unsigned)view.pageCount);
+    // Apply visibility after page variables, which may trigger HMI scripts.
+    const bool canPrev = view.pageIndex > 0U;
+    const bool canNext = view.pageIndex + 1U < view.pageCount;
+    // HMI navigation scripts can change these buttons independently of our
+    // visibility cache. Always apply both states, including explicit vis ...,0.
+    configVisibilityKnownMask_ &= ~((1UL << 3U) | (1UL << 4U));
+    (void)setConfigVisibility_(3U, "bPrev", canPrev);
+    (void)sendCmdFmt_("tsw bPrev,%u", canPrev ? 1U : 0U);
+    (void)setConfigVisibility_(4U, "bNext", canNext);
+    (void)sendCmdFmt_("tsw bNext,%u", canNext ? 1U : 0U);
+}
+
 bool NextionDriver::renderConfigMenu(const ConfigMenuView& view)
 {
     if (!started_) return false;
@@ -645,20 +746,13 @@ bool NextionDriver::renderConfigMenu(const ConfigMenuView& view)
     }
 
     (void)sendText_("tPath", view.breadcrumb);
-    (void)sendCmdFmt_("vis bHome,%u", view.canHome ? 1U : 0U);
+    (void)setConfigVisibility_(0U, "bHome", view.canHome);
     (void)sendCmdFmt_("tsw bHome,%u", view.canHome ? 1U : 0U);
-    (void)sendCmdFmt_("vis bBack,%u", view.canBack ? 1U : 0U);
+    (void)setConfigVisibility_(1U, "bBack", view.canBack);
     (void)sendCmdFmt_("tsw bBack,%u", view.canBack ? 1U : 0U);
-    (void)sendCmdFmt_("vis bValid,%u", view.canValidate ? 1U : 0U);
+    (void)setConfigVisibility_(2U, "bValid", view.canValidate);
     (void)sendCmdFmt_("tsw bValid,%u", view.canValidate ? 1U : 0U);
-    const bool canPrev = view.pageIndex > 0U;
-    const bool canNext = view.pageIndex + 1U < view.pageCount;
-    (void)sendCmdFmt_("vis bPrev,%u", canPrev ? 1U : 0U);
-    (void)sendCmdFmt_("tsw bPrev,%u", canPrev ? 1U : 0U);
-    (void)sendCmdFmt_("vis bNext,%u", canNext ? 1U : 0U);
-    (void)sendCmdFmt_("tsw bNext,%u", canNext ? 1U : 0U);
-    (void)sendCmdFmt_("nPage.val=%u", (unsigned)(view.pageIndex + 1U));
-    (void)sendCmdFmt_("nPages.val=%u", (unsigned)view.pageCount);
+    updateConfigPagination_(view);
     (void)sendCmdFmt_("vaCtxRef.val=%lu", (unsigned long)view.contextRef);
 
     for (uint8_t i = 0; i < ConfigMenuModel::RowsPerPage; ++i) {
@@ -693,10 +787,11 @@ bool NextionDriver::renderConfigMenu(const ConfigMenuView& view)
         if (editType > 3U) editType = 0U;
         if (!row.visible || !row.valueVisible || !row.editable) editType = 0U;
 
-        (void)sendCmdFmt_("vis %s,%u", leftObj, row.visible ? 1U : 0U);
+        const uint8_t visibilityBit = (uint8_t)(5U + (i * 3U));
+        (void)setConfigVisibility_(visibilityBit, leftObj, row.visible);
         (void)sendCmdFmt_("tsw %s,%u", leftObj, leftTouchable ? 1U : 0U);
-        (void)sendCmdFmt_("vis %s,%u", rightObj, showValue ? 1U : 0U);
-        (void)sendCmdFmt_("vis %s,%u", rowButtonObj, showRowButton ? 1U : 0U);
+        (void)setConfigVisibility_((uint8_t)(visibilityBit + 1U), rightObj, showValue);
+        (void)setConfigVisibility_((uint8_t)(visibilityBit + 2U), rowButtonObj, showRowButton);
         (void)sendCmdFmt_("tsw %s,%u", rowButtonObj, showRowButton ? 1U : 0U);
         if (alarmRow) {
             const uint32_t leftBco = alarmCritical ? 53925U : (alarmLatchOk ? 64520U : 12710U);
@@ -745,6 +840,10 @@ bool NextionDriver::refreshConfigMenuValues(const ConfigMenuView& view)
 {
     if (!started_ || !pageReady_) return false;
     if (sleeping_) return false;
+    // A keyboard return or navigation invalidates the whole page, so a
+    // values-only reply must also restore labels, buttons and visibility.
+    if (configVisibilityKnownMask_ == 0U) return renderConfigMenu(view);
+    updateConfigPagination_(view);
     (void)sendCmdFmt_("vaCtxRef.val=%lu", (unsigned long)view.contextRef);
 
     for (uint8_t i = 0; i < ConfigMenuModel::RowsPerPage; ++i) {
@@ -765,11 +864,12 @@ bool NextionDriver::refreshConfigMenuValues(const ConfigMenuView& view)
         char rowButtonObj[8]{};
         snprintf(leftObj, sizeof(leftObj), "tL%u", (unsigned)i);
         snprintf(rowButtonObj, sizeof(rowButtonObj), "bR%u", (unsigned)i);
+        const uint8_t visibilityBit = (uint8_t)(5U + (i * 3U));
 
         if (alarmRow) {
             const uint32_t leftBco = alarmCritical ? 53925U : (alarmLatchOk ? 64520U : 12710U);
             (void)sendCmdFmt_("%s.bco=%lu", leftObj, (unsigned long)leftBco);
-            (void)sendCmdFmt_("vis %s,%u", rowButtonObj, showRowButton ? 1U : 0U);
+            (void)setConfigVisibility_((uint8_t)(visibilityBit + 2U), rowButtonObj, showRowButton);
             (void)sendCmdFmt_("tsw %s,%u", rowButtonObj, showRowButton ? 1U : 0U);
             if (alarmLatchOk) {
                 (void)sendCmdFmt_("%s.bco=%u", rowButtonObj, 64520U);
@@ -785,14 +885,14 @@ bool NextionDriver::refreshConfigMenuValues(const ConfigMenuView& view)
         if (!row.visible || !showValue) {
             char rightObjHidden[8]{};
             snprintf(rightObjHidden, sizeof(rightObjHidden), "tV%u", (unsigned)i);
-            (void)sendCmdFmt_("vis %s,0", rightObjHidden);
+            (void)setConfigVisibility_((uint8_t)(visibilityBit + 1U), rightObjHidden, false);
             (void)sendCmdFmt_("tsw %s,0", rightObjHidden);
             continue;
         }
 
         char rightObj[8]{};
         snprintf(rightObj, sizeof(rightObj), "tV%u", (unsigned)i);
-        (void)sendCmdFmt_("vis %s,1", rightObj);
+        (void)setConfigVisibility_((uint8_t)(visibilityBit + 1U), rightObj, true);
         if (alarmRow && showValue) {
             (void)sendCmdFmt_("%s.bco=%lu", rightObj, (unsigned long)(alarmCritical ? 53925U : 64520U));
         }
@@ -848,15 +948,19 @@ bool NextionDriver::parseCustomFrame_(const uint8_t* frame, uint8_t len, HmiEven
                     out.type = HmiEventType::Home;
                     return true;
                 case NAV_BACK:
+                    noteConfigPageNavigation_();
                     out.type = HmiEventType::Back;
                     return true;
                 case NAV_VALIDATE:
+                    noteConfigPageNavigation_();
                     out.type = HmiEventType::Validate;
                     return true;
                 case NAV_NEXT:
+                    noteConfigPageNavigation_();
                     out.type = HmiEventType::NextPage;
                     return true;
                 case NAV_PREV:
+                    noteConfigPageNavigation_();
                     out.type = HmiEventType::PrevPage;
                     return true;
                 case NAV_CONFIG_EXIT:
@@ -894,6 +998,7 @@ bool NextionDriver::parseCustomFrame_(const uint8_t* frame, uint8_t len, HmiEven
 
         case NEXTION_CMD_ROW_SET_TEXT: {
             if (payloadLen < 2U || payload[0] >= ConfigMenuModel::RowsPerPage) return false;
+            noteConfigPageNavigation_();
             out.type = HmiEventType::RowSetText;
             out.row = payload[0];
             const uint8_t textLen = (uint8_t)(payloadLen - 1U);
@@ -990,6 +1095,12 @@ bool NextionDriver::handlePageId_(uint8_t pageId, bool emitEvents, HmiEvent& out
 
     if (!emitEvents) return false;
     const bool pageChanged = (!wasKnown || prevPage != pageId);
+    if (pageChanged) {
+        configVisibilityMask_ = 0U;
+        // Returning from a keyboard recreates the menu with HMI defaults.
+        // Neither visible nor hidden states from the previous page are known.
+        configVisibilityKnownMask_ = 0U;
+    }
     if (pageReady_ && !wasConfigPage) {
         out.type = HmiEventType::ConfigEnter;
         out.pageId = pageId;
@@ -1057,6 +1168,7 @@ bool NextionDriver::pollEvent(HmiEvent& out)
                 const uint8_t pageId = pageResponseBuf_[0];
                 pageResponseActive_ = false;
                 pageResponseLen_ = 0U;
+                emitDebug_(valid ? "page-rx" : "page-drop", pageResponseBuf_, PageResponseBufSize);
                 if (valid && handlePageId_(pageId, true, out)) {
                     return true;
                 }
@@ -1099,6 +1211,7 @@ bool NextionDriver::pollEvent(HmiEvent& out)
             customBuf_[customLen_++] = b;
             if (customLen_ >= customExpectedLen_) {
                 const uint8_t frameLen = customExpectedLen_;
+                emitDebug_("custom-rx", customBuf_, frameLen);
                 const bool parsed = parseCustomFrame_(customBuf_, customExpectedLen_, out);
                 customFrameActive_ = false;
                 customExpectedLen_ = 0U;

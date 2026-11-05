@@ -78,10 +78,7 @@ Si aucun paquet n'est vu pendant environ 9 secondes:
 - `FlowConnectDisplay` cache l'objet Nextion `tFConnectState`.
 
 Quand `Welcome.accepted=1` est reçu, `FlowConnectDisplay` affiche `tFConnectState`.
-Il met également `globals.vaFlowComm.val` à `1`. Cette valeur représente un
-lien FlowIO confirmé et encore actif; elle repasse à `0` au timeout, au refus
-de connexion ou à la perte du Wi-Fi. Le TFT Nextion doit déclarer la variable
-globale numérique `vaFlowComm` pour afficher ou exploiter cet état.
+Voir le contrat d'intégration dans `docs/integration/nextion-esp-protocol.md`.
 
 ## Token
 
@@ -91,10 +88,19 @@ jamais envoyé en clair: `FlowConnectDisplay` place seulement `tokenCrc` dans
 `Hello`. Si le token `FlowIO` est vide, tout Flow Connect Display est accepté;
 sinon le CRC doit correspondre.
 
-Le portail captif de ce firmware ne configure que le Wi-Fi. Il n'expose pas
-encore le token `fcd/udp/token`; laisser le token vide côté FlowIO pour
+Le portail captif configure le Wi-Fi et permet les mises à jour des firmwares
+ESP32 et Nextion. Il n'expose pas encore le token `fcd/udp/token`; laisser le token vide côté FlowIO pour
 l'appairage standard, ou renseigner la valeur correspondante dans la
 configuration persistante de FlowConnectDisplay.
+
+Le portail AP permet aussi de téléverser un fichier `.tft` vers le Nextion.
+Le fichier est relayé directement depuis la connexion HTTP vers l'UART, sans
+stockage du TFT en flash ni allocation de sa taille en RAM. Le transfert suit
+le protocole Nextion v1.1 : blocs de 4096 octets et attente de l'ACK `0x05`
+après chaque bloc. L'ESP utilise 460800 bauds pendant le transfert puis restaure
+le débit normal de 115200 bauds. La page reste disponible en mode AP; si le
+transfert est interrompu après le démarrage du bootloader Nextion, un nouveau
+chargement ou un redémarrage physique de l'écran peut être nécessaire.
 
 ## RTC
 

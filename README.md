@@ -17,7 +17,9 @@ nécessaires à l'afficheur distant :
 
 Le firmware ne contient pas de client MQTT ni de configuration broker. Il
 n'active pas PSRAM et n'utilise pas le serveur HTTP asynchrone. Le portail
-utilise les composants réseau inclus dans le framework Arduino ESP32. Le dépôt
+utilise les composants réseau inclus dans le framework Arduino ESP32. Ses
+ressources web compressées sont embarquées dans le firmware; le portail AP ne
+monte pas SPIFFS. Le dépôt
 conserve les sources communes Flow.io pour aligner le profil et les interfaces
 de modules sur le firmware principal ; le filtre PlatformIO du profil exclut
 les fonctions qui ne servent pas à l'afficheur.
@@ -48,9 +50,16 @@ Le terminal série est configuré à `115200` bauds.
    token est activé côté Flow.io, FlowConnectDisplay doit recevoir le même
    token dans `fcd/udp/token` via sa configuration persistante.
 
-Le portail captif configure le Wi-Fi uniquement; il ne propose pas encore de
-champ pour le token UDP. La configuration par défaut, avec token vide, permet
-l'appairage sans étape supplémentaire.
+Le portail captif configure le Wi-Fi et permet les mises à jour ESP32 et
+Nextion. Il ne propose pas encore de champ pour le token UDP. La configuration
+par défaut, avec token vide, permet l'appairage sans étape supplémentaire.
+
+En mode point d'accès, la page permet aussi de téléverser un firmware ESP32
+`.bin`. L'image est écrite par blocs dans le slot OTA inactif et vérifiée avant
+le redémarrage. La table de partitions comprend deux slots OTA de 1,5 Mio.
+Les appareils encore dotés de l'ancienne table à slot unique doivent recevoir
+une première installation complète par USB/série avant d'accepter une mise à
+jour OTA depuis la page web.
 
 ## Contrat UDP
 

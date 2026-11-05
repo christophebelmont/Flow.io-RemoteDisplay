@@ -70,7 +70,7 @@ public:
     bool setTouchEnabled(bool enabled);
     bool setObjectVisible(const char* objectName, bool visible);
     bool setNumericValue(const char* objectName, uint32_t value);
-    bool showConfigLoading(const char* title);
+    bool uploadFirmware(size_t imageSize, HmiFirmwareReadCallback read, void* readCtx);
     bool publishV2Needles(const NextionV2NeedlePublish& publish) override;
 
 private:
@@ -102,6 +102,8 @@ private:
     uint8_t touchResponseBuf_[TouchResponseBufSize]{};
     bool currentPageKnown_ = false;
     uint8_t currentPage_ = 0;
+    uint32_t configVisibilityMask_ = 0U;
+    uint32_t configVisibilityKnownMask_ = 0U;
 
     bool parseCustomFrame_(const uint8_t* frame, uint8_t len, HmiEvent& out);
     bool handlePageId_(uint8_t pageId, bool emitEvents, HmiEvent& out);
@@ -109,9 +111,13 @@ private:
     bool isConfigPageId_(uint8_t pageId) const;
     bool isAlarmPageId_(uint8_t pageId) const;
     bool isMenuPageId_(uint8_t pageId) const;
+    void updateConfigPagination_(const ConfigMenuView& view);
+    bool setConfigVisibility_(uint8_t bit, const char* objectName, bool visible);
+    void noteConfigPageNavigation_();
     void emitDebug_(const char* kind, const uint8_t* data, uint8_t len) const;
 
     bool sendCmd_(const char* cmd);
+    bool sendRawCmd_(const char* cmd);
     bool sendCmdFmt_(const char* fmt, ...);
     bool sendNum_(const char* objectName, uint32_t value);
     bool sendInt_(const char* objectName, int32_t value);
@@ -120,6 +126,7 @@ private:
     bool readNumberResponse_(uint32_t& value, uint16_t timeoutMs);
     bool readText_(const char* expr, char* out, size_t outLen, uint16_t timeoutMs);
     bool readTextResponse_(char* out, size_t outLen, uint16_t timeoutMs);
+    bool waitUploadAck_(uint16_t timeoutMs);
     const char* homeTextObjectName_(HmiHomeTextField field) const;
     const char* homeGaugeObjectName_(HmiHomeGaugeField field) const;
     void sanitizeText_(char* out, size_t outLen, const char* in) const;

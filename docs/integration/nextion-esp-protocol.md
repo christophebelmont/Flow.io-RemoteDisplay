@@ -87,16 +87,6 @@ Bits actuellement utilisés :
 - bit `4` : alarme temps max pompe ORP
 - bit `5` : alarme PSI
 
-### État de communication Flow Connect Display
-
-En mode écran déporté, Flow Connect Display maintient `globals.vaFlowComm.val`:
-- `1` : un lien FlowIO a été confirmé et un paquet valide a été reçu depuis
-  moins de 6 secondes;
-- `0` : lien non établi, refusé, Wi-Fi indisponible ou timeout réseau.
-
-La variable globale numérique `vaFlowComm` doit être présente dans le projet
-Nextion TFT. Elle décrit l'état du lien et non une transaction ponctuelle.
-
 ### Page de configuration
 
 Le driver rend la configuration sur la page `pageCfgMenu` après réception

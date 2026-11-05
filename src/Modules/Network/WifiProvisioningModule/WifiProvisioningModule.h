@@ -8,6 +8,10 @@
 #include "Core/EventBus/EventBus.h"
 #include "Core/ServiceBinding.h"
 #include "Core/Services/Services.h"
+#if defined(FLOW_PROFILE_FLOW_CONNECT_DISPLAY)
+#include "Core/Services/ILogger.h"
+#include "Modules/Network/WifiProvisioningModule/WebLogBuffer.h"
+#endif
 
 #include <DNSServer.h>
 #include <WiFi.h>
@@ -200,7 +204,6 @@ private:
     WiFiServer portalServer_{80};
     bool portalHttpActive_ = false;
     bool portalCredentialsSaved_ = false;
-    bool portalSpiffsReady_ = false;
     bool portalRebootPending_ = false;
     char portalReqLine_[384] = {0};
     char portalPath_[384] = {0};
@@ -214,6 +217,11 @@ private:
     char portalScanJson_[Limits::Wifi::Buffers::ScanStatusJson] = {0};
     uint8_t portalFileBuf_[256] = {0};
     uint32_t portalRebootAtMs_ = 0;
+    WebLogBuffer webLogs_{};
+    portMUX_TYPE webLogsMux_ = portMUX_INITIALIZER_UNLOCKED;
+    const LogHubService* logHubSvc_ = nullptr;
+    uint32_t webLogSession_ = 0;
+    bool webLogSinkRegistered_ = false;
 #endif
 
     bool isWebReachable_() const;
@@ -243,6 +251,10 @@ private:
     bool getStaIp_(char* out, size_t len) const;
     bool getApIp_(char* out, size_t len) const;
 #if defined(FLOW_PROFILE_FLOW_CONNECT_DISPLAY)
+    static void captureWebLog_(void* ctx, const LogEntry& entry);
+    void sendWebLogs_(WiFiClient& client, const char* query);
+    void sendLogLevels_(WiFiClient& client);
+    void setLogLevel_(WiFiClient& client, const char* body);
     void startLightPortal_();
     void stopLightPortal_();
     void handleLightPortalClient_();
@@ -254,7 +266,9 @@ private:
     void sendHttpHeader_(WiFiClient& client, const char* status, const char* contentType);
     void sendJson_(WiFiClient& client, const char* status, const char* body);
     void sendPlain_(WiFiClient& client, const char* status, const char* body);
-    bool sendSpiffsAsset_(WiFiClient& client, const char* path, const char* contentType);
+    bool sendEmbeddedAsset_(WiFiClient& client, const char* path);
+    void handleFirmwareUpload_(WiFiClient& client, size_t contentLength);
+    void handleNextionFirmwareUpload_(WiFiClient& client, size_t contentLength);
     void sendPortalFallbackPage_(WiFiClient& client, const char* message, bool success);
     void sendWebMetaJson_(WiFiClient& client);
     void sendWifiConfigJson_(WiFiClient& client);
